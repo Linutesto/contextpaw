@@ -138,3 +138,36 @@ def test_calibrated_counter_overestimates_by_design():
     c = CalibratedCounter()
     text = "hello world this is a test"
     assert c.count(text) >= len(text) * 0.34
+
+
+# --------------------------- summarizer chunking ---------------------------
+
+def test_summarizer_chunks_cover_the_whole_span():
+    """
+    The bug this locks down: trimming the span head+tail before summarizing drops the
+    MIDDLE -- which is precisely the region compaction evicted and the summarizer exists
+    to rescue. Measured, that scored 0/3 facts recovered. Chunking scored 3/3.
+    Every character of the span must appear in some chunk.
+    """
+    from contextpaw.summarize import Summarizer
+
+    s = Summarizer(session=None, max_input_chars=100, max_chunks=999)
+    span = "".join(f"[{i:04d}]" for i in range(500))  # 3000 chars, unique markers
+    chunks = s._chunks(span)
+
+    assert "".join(chunks) == span, "chunks must reconstruct the span exactly — nothing skipped"
+    assert "[0250]" in "".join(chunks), "the MIDDLE must survive"
+
+
+def test_summarizer_strides_across_a_pathological_span():
+    """When a span is too big to summarize whole, sample ACROSS it -- never truncate one end."""
+    from contextpaw.summarize import Summarizer
+
+    s = Summarizer(session=None, max_input_chars=10, max_chunks=5)
+    span = "".join(f"{i:02d}" for i in range(100))  # 200 chars -> 20 chunks, capped to 5
+    chunks = s._chunks(span)
+
+    assert len(chunks) == 5
+    joined = "".join(chunks)
+    # must reach the far end, not just the first 5 chunks
+    assert span[-10:] in joined or span[-2:] in joined, "must sample the tail, not truncate to the head"

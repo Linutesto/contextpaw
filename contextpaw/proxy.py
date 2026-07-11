@@ -25,7 +25,9 @@ import time
 
 from aiohttp import web, ClientSession, ClientTimeout
 
-from .compact import compact_messages, compact_prompt, TooLongToCompact
+from .compact import compact_messages, compact_prompt, inject_digest, TooLongToCompact
+from .runtime import RuntimeManager
+from .summarize import Summarizer
 from .tokens import CalibratedCounter, HFCounter
 
 DEFAULT_MARGIN = 256  # headroom for the chat template, BOS, and our own marker
@@ -41,6 +43,12 @@ class ContextPaw:
         margin=DEFAULT_MARGIN,
         tokenizer=None,
         keep_recent=4,
+        summarize=False,
+        summarizer_model="gemma3:1b",
+        summarizer_url=None,
+        arbitrate=False,
+        llamacpp_cmd=None,
+        min_hold=20.0,
     ):
         self.ollama = ollama.rstrip("/")
         self.llamacpp = llamacpp.rstrip("/")
@@ -51,6 +59,16 @@ class ContextPaw:
         self.counter = HFCounter(tokenizer) if tokenizer else CalibratedCounter()
         self.session: ClientSession | None = None
         self.stats = {"requests": 0, "compacted": 0, "refused": 0, "retried_400": 0}
+
+        self.summarize_enabled = summarize
+        self.summarizer_model = summarizer_model
+        self.summarizer_url = summarizer_url or ollama
+        self.summarizer: Summarizer | None = None
+
+        self.arbitrate = arbitrate
+        self.llamacpp_cmd = llamacpp_cmd
+        self.min_hold = min_hold
+        self.rt: RuntimeManager | None = None
 
     # ---------- budgeting ----------
 
@@ -72,7 +90,7 @@ class ContextPaw:
 
     # ---------- the actual work ----------
 
-    def _apply(self, body: dict) -> tuple[dict, dict | None]:
+    async def _apply(self, body: dict) -> tuple[dict, dict | None]:
         """Preflight + compact. Returns (possibly rewritten body, report|None)."""
         if self.policy == "off":
             return body, None
@@ -84,10 +102,12 @@ class ContextPaw:
                 body["messages"], budget, self._count, keep_recent=self.keep_recent
             )
             if rep.compacted:
+                msgs = await self._maybe_summarize(msgs, rep, budget)
                 body = {**body, "messages": msgs}
         elif "prompt" in body and isinstance(body["prompt"], str):
             text, rep = compact_prompt(body["prompt"], budget, self._count)
             if rep.compacted:
+                text = await self._maybe_summarize(text, rep, budget)
                 body = {**body, "prompt": text}
         else:
             return body, None
@@ -122,6 +142,29 @@ class ContextPaw:
         self.stats["compacted"] += 1
         return body, rep.as_dict()
 
+    async def _maybe_summarize(self, payload, rep, budget):
+        """Replace the 'this is gone' marker with an actual digest of what went."""
+        if not self.summarizer or not rep.evicted_text:
+            return payload
+        digest = await self.summarizer.summarize(rep.evicted_text)
+        if not digest:
+            return payload  # best-effort: keep the plain marker, never fail the request
+
+        out = inject_digest(payload, rep, digest)
+
+        # The digest costs tokens too. If it pushed us back over budget, drop it --
+        # a summary that re-overflows the window would recreate the very bug we exist
+        # to prevent.
+        if isinstance(out, str):
+            size = self._count(out)
+        else:
+            size = sum(self._count(str(m.get("content", ""))) for m in out)
+        if size > budget:
+            rep.summarized = False
+            return payload
+        rep.final_tokens = size
+        return out
+
     # ---------- routing ----------
 
     def _upstream(self, request) -> str:
@@ -144,8 +187,18 @@ class ContextPaw:
         except Exception:
             return await self._passthrough(request, None)
 
+        if self.rt and self.rt.enabled:
+            want = "llamacpp" if self._upstream(request) == self.llamacpp else "ollama"
+            try:
+                await self.rt.ensure(want)
+            except Exception as e:
+                return web.json_response(
+                    {"error": {"type": "runtime_switch_failed", "message": str(e)}},
+                    status=503,
+                )
+
         try:
-            body, report = self._apply(body)
+            body, report = await self._apply(body)
         except TooLongToCompact as e:
             self.stats["refused"] += 1
             return web.json_response(
@@ -249,6 +302,10 @@ class ContextPaw:
              "counter": self.counter.name, "exact": self.counter.exact()}
         if hasattr(self.counter, "stats"):
             s["calibration"] = self.counter.stats()
+        if self.summarizer:
+            s["summarizer"] = {"model": self.summarizer.model, **self.summarizer.stats}
+        if self.rt:
+            s["runtime"] = await self.rt.status()
         return web.json_response(s)
 
 
@@ -263,6 +320,21 @@ def build_app(paw: ContextPaw) -> web.Application:
         except Exception:
             paw._llamacpp_up = False
 
+        if paw.summarize_enabled:
+            paw.summarizer = Summarizer(
+                paw.session, url=paw.summarizer_url, model=paw.summarizer_model
+            )
+        paw.rt = RuntimeManager(
+            paw.session,
+            ollama_url=paw.ollama,
+            llamacpp_url=paw.llamacpp,
+            llamacpp_cmd=paw.llamacpp_cmd,
+            min_hold=paw.min_hold,
+            enabled=paw.arbitrate,
+        )
+        if paw.arbitrate and paw._llamacpp_up:
+            paw.rt.active = "llamacpp"
+
     async def _cleanup(_):
         if paw.session:
             await paw.session.close()
@@ -271,7 +343,14 @@ def build_app(paw: ContextPaw) -> web.Application:
     app.on_cleanup.append(_cleanup)
 
     app.router.add_get("/contextpaw/health", paw.health)
+    app.router.add_get("/contextpaw/runtime", lambda r: _runtime_status(paw, r))
     for p in ("/api/generate", "/api/chat", "/v1/completions", "/v1/chat/completions"):
         app.router.add_post(p, paw.handle)
     app.router.add_route("*", "/{tail:.*}", paw._passthrough)
     return app
+
+
+async def _runtime_status(paw: ContextPaw, _):
+    if not paw.rt:
+        return web.json_response({"enabled": False})
+    return web.json_response(await paw.rt.status())

@@ -117,6 +117,73 @@ keeping its head and tail. (This exact bug was found by the test suite, not by l
 
 ---
 
+## Summarize what you evict (`--summarize`)
+
+A marker saying *"12431 tokens were elided"* tells the agent a hole exists. A **digest**
+tells it what was in the hole.
+
+```bash
+contextpaw --summarize --summarizer-model gemma3:1b
+```
+
+Three facts were buried in the **middle** of an over-long prompt — squarely inside the
+region compaction evicts. Then we asked for them back:
+
+| | facts recovered | the model said |
+|---|---|---|
+| evict only | **0 / 3** | *"Production_Server … erreur de syntaxe … Marc"* |
+| `--summarize` | **3 / 3** | *"Orion-7 … certificats TLS expirés … Marie-Claude"* |
+
+Read the first row again. **The model hallucinated even though the marker explicitly told
+it the information was gone.** Telling an agent "you lost something" does not stop it
+inventing — you have to give the content back. That is the whole case for the summarizer,
+and we only know it because we measured it.
+
+Implementation notes that matter:
+
+- **Map-reduce over the whole span, never head+tail.** The first version trimmed the span
+  to fit the summarizer's own window — and scored **0/3**, because the facts were in the
+  middle of the evicted span, so it dropped them again. It reproduced, inside the
+  summarizer, the exact bug this project exists to fix. Now every chunk is summarized and
+  merged. (`test_summarizer_chunks_cover_the_whole_span`)
+- **Cached by content hash.** In an agent loop the same old turns are evicted every single
+  turn; without a cache you would pay for the identical digest forever.
+- **Best-effort, never fatal.** If the summarizer is down, times out, or returns nothing,
+  we fall back to the plain marker. A rescue tool that fails the request it was rescuing
+  is worse than no tool at all.
+
+---
+
+## One runtime owns the GPU (`--arbitrate`)
+
+A 24 GB card cannot hold Ollama's model *and* a llama.cpp server. Measured on an RTX 4090:
+gemma-4-12b in Ollama at 4×32k = **15.1 GB**; qwythos-9b in llama.cpp at 4×32k = **11.0 GB**.
+26.1 GB > 24 GB. They do not coexist.
+
+The dangerous part: **nothing tells you.** Ollama will load a model on top of a running
+llama.cpp server and — with `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` — spill to system RAM
+*silently*, 20× slower, while `ollama ps` still cheerfully reports `100% GPU`. Same disease
+as silent truncation: **the system would rather lie than say no.**
+
+ContextPaw sees every request, so it knows which runtime the caller wants. It evicts the
+other one first.
+
+```bash
+contextpaw --arbitrate \
+  --llamacpp-cmd '/path/to/llama-server -m model.gguf --parallel 4 -c 32768 -ngl 99 --port 8091'
+```
+
+```
+$ curl localhost:11434/contextpaw/runtime
+{"active": "llamacpp", "llamacpp_alive": true, "ollama_models_loaded": [], "stats": {"switches": 2}}
+```
+
+Measured switch cost: **llama.cpp → Ollama 5.1s**, **Ollama → llama.cpp 2.3s**. Cheap enough
+to do on demand. `--min-hold` (default 20s) stops two callers flip-flopping the card and
+spending all their time reloading models instead of generating.
+
+---
+
 ## Policies
 
 ```bash
@@ -146,10 +213,10 @@ contextpaw --tokenizer google/gemma-3-1b-it
 
 ## Limitations (v0.1)
 
-- Evicted content is **dropped, not summarized**. Summarizing the evicted span into a compact
-  note is the obvious next step (a small local model is more than enough for that job).
 - On **streaming** responses the eviction report is delivered in headers only — the body is
   proxied through untouched.
+- The summarizer adds latency on the turn where it runs (5 calls to a 1B model, ~10s for a
+  17k-token span) — then it is cached. Enable it for agent loops, not for chat.
 - Raw-prompt compaction (`/api/generate`) is head+tail; only *chat messages* get true
   semantic, per-message eviction. Structure your calls as messages if you can.
 - Character-proportional slicing, not token-offset slicing, when using the calibrated counter.
@@ -158,7 +225,7 @@ contextpaw --tokenizer google/gemma-3-1b-it
 ## Tests
 
 ```bash
-python3 -m pytest tests/ -q     # 12 passed
+python3 -m pytest tests/ -q     # 14 passed
 ```
 
 MIT.

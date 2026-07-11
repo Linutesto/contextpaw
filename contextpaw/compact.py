@@ -31,6 +31,12 @@ class CompactionReport:
     budget: int = 0
     evicted: list = field(default_factory=list)  # human-readable list of what went
     exact_count: bool = False
+    summarized: bool = False
+    # raw text we threw away, so a summarizer can be run over it afterwards, plus the
+    # exact marker string we inserted, so the digest can be spliced into its place
+    evicted_text: str = ""
+    marker: str = ""
+    marker_what: str = "content"
 
     def as_dict(self) -> dict:
         return {
@@ -42,15 +48,50 @@ class CompactionReport:
             "budget": self.budget,
             "evicted": self.evicted,
             "exact_count": self.exact_count,
+            "summarized": self.summarized,
         }
 
 
-def _marker(n_tokens: int, what: str = "content") -> str:
-    return (
-        f"\n\n[contextpaw: {n_tokens} tokens of {what} elided to fit the context window. "
-        f"This information is GONE from your context — if you need it, fetch it again "
-        f"rather than guessing.]\n\n"
+def _marker(n_tokens: int, what: str = "content", digest: str | None = None) -> str:
+    head = (
+        f"\n\n[contextpaw: {n_tokens} tokens of {what} elided to fit the context window."
     )
+    if digest:
+        return (
+            f"{head}\n"
+            f"Here is a digest of what was removed — treat it as a summary, not as the "
+            f"original text. If you need exact details, fetch them again rather than "
+            f"guessing.\n\nDIGEST:\n{digest}]\n\n"
+        )
+    return (
+        f"{head} This information is GONE from your context — if you need it, fetch it "
+        f"again rather than guessing.]\n\n"
+    )
+
+
+def inject_digest(payload, rep: "CompactionReport", digest: str):
+    """
+    Splice a summary of the evicted span into the marker we already inserted.
+
+    `payload` is either the prompt string or the message list. We replace the exact
+    marker text, so this is safe whichever shape we are dealing with.
+    """
+    if not digest or not rep.marker:
+        return payload
+    new_marker = _marker(rep.evicted_tokens, rep.marker_what, digest)
+    rep.summarized = True
+
+    if isinstance(payload, str):
+        return payload.replace(rep.marker, new_marker)
+
+    out = []
+    for m in payload:
+        c = m.get("content")
+        if isinstance(c, str) and rep.marker.strip() and rep.marker.strip() in c:
+            out.append({**m, "content": c.replace(rep.marker.strip(), new_marker.strip())})
+        else:
+            out.append(m)
+    return out
 
 
 class TooLongToCompact(Exception):
@@ -81,11 +122,14 @@ def compact_prompt(text: str, budget: int, count, *, head_frac=0.35, tail_frac=0
     tail = text[-tail_chars:] if tail_chars else ""
     dropped = total - count(head) - count(tail)
 
-    out = head + _marker(max(dropped, 0)) + tail
+    evicted_text = text[head_chars: len(text) - tail_chars] if tail_chars else text[head_chars:]
+    marker = _marker(max(dropped, 0))
+
+    out = head + marker + tail
     # The marker itself costs tokens; if we overshot, trim the tail until it fits.
     while count(out) > budget and len(tail) > 200:
         tail = tail[len(tail) // 5 :]
-        out = head + _marker(max(dropped, 0)) + tail
+        out = head + marker + tail
 
     if count(out) > budget:
         raise TooLongToCompact(
@@ -97,6 +141,9 @@ def compact_prompt(text: str, budget: int, count, *, head_frac=0.35, tail_frac=0
     rep.final_tokens = count(out)
     rep.evicted_tokens = max(dropped, 0)
     rep.evicted = [f"{max(dropped,0)} tokens from the middle of the prompt"]
+    rep.evicted_text = evicted_text
+    rep.marker = marker
+    rep.marker_what = "content"
     return out, rep
 
 
@@ -140,6 +187,7 @@ def compact_messages(messages: list, budget: int, count, *, keep_recent: int = 4
     freed = 0
     need = total - budget
     evicted_desc = []
+    evicted_chunks = []
 
     for i in evictable:
         if freed >= need:
@@ -148,6 +196,7 @@ def compact_messages(messages: list, budget: int, count, *, keep_recent: int = 4
         freed += sizes[i]
         role = messages[i].get("role", "?")
         evicted_desc.append(f"message #{i} ({role}, {sizes[i]} tokens)")
+        evicted_chunks.append((i, role, msg_text(messages[i])))
 
     out = []
     for i, m in enumerate(messages):
@@ -165,10 +214,16 @@ def compact_messages(messages: list, budget: int, count, *, keep_recent: int = 4
             )
 
     # fix up the marker text with the real number now that we know it
+    marker_text = _marker(freed, "earlier conversation and tool output").strip()
     for m in out:
         if m.get("_contextpaw_marker"):
-            m["content"] = _marker(freed, "earlier conversation and tool output").strip()
+            m["content"] = marker_text
             m.pop("_contextpaw_marker", None)
+
+    evicted_chunks.sort()
+    rep.evicted_text = "\n\n".join(f"[{role}]\n{txt}" for _, role, txt in evicted_chunks)
+    rep.marker = marker_text
+    rep.marker_what = "earlier conversation and tool output"
 
     final = sum(count(msg_text(m)) for m in out)
     strategy = f"evict-biggest-first (system + last {keep_recent} preserved)"
