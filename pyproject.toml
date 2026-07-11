@@ -5,10 +5,34 @@ description = "Make LLM context overflow honest: stop Ollama truncating your pro
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
+authors = [{ name = "Yan Desbiens", email = "yandesbiens420@gmail.com" }]
+keywords = [
+    "llm", "ollama", "llama-cpp", "context-window", "ai-agents",
+    "proxy", "local-llm", "context-management", "truncation", "rag",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Internet :: Proxy Servers",
+]
 dependencies = ["aiohttp>=3.9"]
 
 [project.optional-dependencies]
 exact = ["tokenizers>=0.15"]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/Linutesto/contextpaw"
+Repository = "https://github.com/Linutesto/contextpaw"
+Issues = "https://github.com/Linutesto/contextpaw/issues"
 
 [project.scripts]
 contextpaw = "contextpaw.cli:main"
@@ -16,3 +40,6 @@ contextpaw = "contextpaw.cli:main"
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["contextpaw*"]
