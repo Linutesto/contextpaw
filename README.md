@@ -12,6 +12,14 @@ Two servers, two opposite lies, same broken agent:
 ContextPaw sits in front of either one and turns overflow into something an agent can
 actually survive: **fit the window, keep what matters, and say out loud what was lost.**
 
+> **Prior art, stated plainly.** Ollama's silent truncation is not a new discovery — it has been
+> reported and left open for years: [#3839](https://github.com/ollama/ollama/issues/3839)
+> *("Detect Truncation Due to Exceeding Context Size", open since **April 2024**)*,
+> [#14259](https://github.com/ollama/ollama/issues/14259) *("truncation happens silently with no
+> user-visible indication")*, [#9208](https://github.com/ollama/ollama/issues/9208).
+> What ContextPaw adds is (a) a **measurement of what the silence actually costs you**, and
+> (b) a fix you can install today without waiting for upstream.
+
 ```
 your app ──► contextpaw :11434 ──► ollama    :11435
                               └──► llama.cpp :8091
