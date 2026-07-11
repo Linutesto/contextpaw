@@ -28,6 +28,10 @@ import subprocess
 import time
 
 
+class RuntimePinned(Exception):
+    """A pinned runtime owns the GPU and refuses to be evicted."""
+
+
 class RuntimeManager:
     def __init__(
         self,
@@ -49,7 +53,14 @@ class RuntimeManager:
         self._proc: subprocess.Popen | None = None
         self._since = 0.0
         self._lock = asyncio.Lock()
-        self.stats = {"switches": 0, "held": 0}
+        self.stats = {"switches": 0, "held": 0, "blocked_by_pin": 0}
+
+        # A PIN takes the card off the table. min_hold protects you for seconds; a pin
+        # protects you for as long as you want. The case this exists for: you are mid
+        # Skyrim session with four NPCs streaming off llama.cpp, and a background service
+        # fires one /api/* request at Ollama -- without a pin, the arbiter would evict
+        # your game's model to serve it. With a pin, the intruder is refused instead.
+        self.pinned: str | None = None
 
     # ---------- probes ----------
 
@@ -129,6 +140,13 @@ class RuntimeManager:
                 self.stats["held"] += 1
                 return {"arbitrated": False, "active": backend}
 
+            if self.pinned and self.pinned != backend:
+                self.stats["blocked_by_pin"] += 1
+                raise RuntimePinned(
+                    f"{self.pinned} is pinned and owns the GPU; refusing to switch to "
+                    f"{backend}. Unpin with: POST /contextpaw/runtime {{\"pin\": null}}"
+                )
+
             held = time.time() - self._since
             if self.active and held < self.min_hold:
                 # Someone else just took the card. Refusing to flip-flop is the whole
@@ -162,10 +180,20 @@ class RuntimeManager:
                 "switch_seconds": round(time.time() - t0, 2),
             }
 
+    async def pin(self, backend: str | None) -> dict:
+        """Pin (or unpin) a runtime. A pinned runtime cannot be evicted."""
+        if backend not in (None, "ollama", "llamacpp"):
+            raise ValueError(backend)
+        if backend:
+            await self.ensure(backend)   # bring it up BEFORE pinning it
+        self.pinned = backend
+        return await self.status()
+
     async def status(self) -> dict:
         return {
             "enabled": self.enabled,
             "active": self.active,
+            "pinned": self.pinned,
             "llamacpp_alive": await self._llamacpp_alive(),
             "ollama_models_loaded": await self._ollama_loaded(),
             "stats": self.stats,

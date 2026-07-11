@@ -26,7 +26,7 @@ import time
 from aiohttp import web, ClientSession, ClientTimeout
 
 from .compact import compact_messages, compact_prompt, inject_digest, TooLongToCompact
-from .runtime import RuntimeManager
+from .runtime import RuntimeManager, RuntimePinned
 from .summarize import Summarizer
 from .tokens import CalibratedCounter, HFCounter
 
@@ -97,10 +97,22 @@ class ContextPaw:
 
     # ---------- the actual work ----------
 
-    async def _apply(self, body: dict) -> tuple[dict, dict | None]:
+    async def _apply(self, body: dict, backend: str = "ollama") -> tuple[dict, dict | None]:
         """Preflight + compact. Returns (possibly rewritten body, report|None)."""
-        if self.no_think and "think" not in body:
-            body = {**body, "think": False}
+        if self.no_think:
+            # The two backends spell "don't think" completely differently, and each one
+            # fails the same silent way if you get it wrong: Ollama returns an empty
+            # `response`, llama.cpp returns an empty `content` with the text stranded in
+            # `reasoning_content`. Sending Ollama's flag to llama.cpp does nothing at all
+            # -- so the option would quietly lie about what it did.
+            if backend == "ollama":
+                if "think" not in body:
+                    body = {**body, "think": False}
+            else:
+                kw = dict(body.get("chat_template_kwargs") or {})
+                if "enable_thinking" not in kw:
+                    kw["enable_thinking"] = False
+                    body = {**body, "chat_template_kwargs": kw}
 
         if self.policy == "off":
             return body, None
@@ -186,6 +198,16 @@ class ContextPaw:
             return self.ollama
         if request.path.startswith("/api/"):
             return self.ollama
+
+        # OpenAI-shaped path (/v1/*).
+        #
+        # When the arbiter is running, route to llama.cpp even if it is currently DOWN --
+        # bringing it up is precisely the arbiter's job. Gating on `_llamacpp_up` (a flag
+        # sampled once at startup) would mean llama.cpp never gets started: every request
+        # would see it down, fall back to Ollama, and the arbiter would never fire. The
+        # snake eats its own tail.
+        if self.arbitrate and self.llamacpp_cmd:
+            return self.llamacpp
         return self.llamacpp if self._llamacpp_up else self.ollama
 
     _llamacpp_up = False
@@ -201,14 +223,21 @@ class ContextPaw:
             want = "llamacpp" if self._upstream(request) == self.llamacpp else "ollama"
             try:
                 await self.rt.ensure(want)
+            except RuntimePinned as e:
+                return web.json_response(
+                    {"error": {"type": "runtime_pinned", "message": str(e),
+                               "pinned": self.rt.pinned, "wanted": want}},
+                    status=409,
+                )
             except Exception as e:
                 return web.json_response(
                     {"error": {"type": "runtime_switch_failed", "message": str(e)}},
                     status=503,
                 )
 
+        backend = "llamacpp" if self._upstream(request) == self.llamacpp else "ollama"
         try:
-            body, report = await self._apply(body)
+            body, report = await self._apply(body, backend)
         except TooLongToCompact as e:
             self.stats["refused"] += 1
             return web.json_response(
@@ -377,6 +406,7 @@ def build_app(paw: ContextPaw) -> web.Application:
 
     app.router.add_get("/contextpaw/health", paw.health)
     app.router.add_get("/contextpaw/runtime", lambda r: _runtime_status(paw, r))
+    app.router.add_post("/contextpaw/runtime", lambda r: _runtime_pin(paw, r))
     for p in ("/api/generate", "/api/chat", "/v1/completions", "/v1/chat/completions"):
         app.router.add_post(p, paw.handle)
     app.router.add_route("*", "/{tail:.*}", paw._passthrough)
@@ -387,3 +417,23 @@ async def _runtime_status(paw: ContextPaw, _):
     if not paw.rt:
         return web.json_response({"enabled": False})
     return web.json_response(await paw.rt.status())
+
+
+async def _runtime_pin(paw: ContextPaw, request):
+    """POST {"pin": "llamacpp"} to take the GPU off the table; {"pin": null} to release."""
+    if not paw.rt or not paw.rt.enabled:
+        return web.json_response({"error": "arbiter is not enabled"}, status=400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if "pin" not in body:
+        return web.json_response(
+            {"error": 'send {"pin": "llamacpp"|"ollama"|null}'}, status=400
+        )
+    try:
+        return web.json_response(await paw.rt.pin(body["pin"]))
+    except ValueError:
+        return web.json_response({"error": f"unknown backend: {body['pin']}"}, status=400)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=503)
