@@ -59,7 +59,8 @@ Reproduce both: `python3 demo_needle.py` and `python3 demo_400.py`.
 ## Install & run
 
 ```bash
-pip install contextpaw
+git clone https://github.com/Linutesto/contextpaw
+cd contextpaw && pip install -e .          # not on PyPI yet
 
 # move the real Ollama off 11434 so ContextPaw can take it
 OLLAMA_HOST=127.0.0.1:11435 ollama serve
