@@ -49,6 +49,7 @@ class ContextPaw:
         arbitrate=False,
         llamacpp_cmd=None,
         min_hold=20.0,
+        no_think=False,
     ):
         self.ollama = ollama.rstrip("/")
         self.llamacpp = llamacpp.rstrip("/")
@@ -69,6 +70,12 @@ class ContextPaw:
         self.llamacpp_cmd = llamacpp_cmd
         self.min_hold = min_hold
         self.rt: RuntimeManager | None = None
+
+        # Thinking models (gemma4, qwen3.x) put their tokens in `thinking` and return an
+        # EMPTY `response`. An app that doesn't know about the field just gets "" and has
+        # no idea why -- another silent lie. This injects `think: false` for clients that
+        # never asked for thinking, so they get text instead of nothing.
+        self.no_think = no_think
 
     # ---------- budgeting ----------
 
@@ -92,6 +99,9 @@ class ContextPaw:
 
     async def _apply(self, body: dict) -> tuple[dict, dict | None]:
         """Preflight + compact. Returns (possibly rewritten body, report|None)."""
+        if self.no_think and "think" not in body:
+            body = {**body, "think": False}
+
         if self.policy == "off":
             return body, None
 
@@ -286,16 +296,39 @@ class ContextPaw:
         if text:
             self.counter.observe(text, actual)
 
-    async def _passthrough(self, request, _):
+    async def _passthrough(self, request, _=None):
+        """
+        Everything we do not compact (/api/tags, /api/pull, /api/embed, ...) is relayed
+        verbatim.
+
+        This STREAMS. Buffering the whole response would be invisible on /api/tags and
+        infuriating on /api/pull, where the body IS a progress stream -- the download bar
+        would freeze and then vomit at the end. If ContextPaw is going to sit on port 11434
+        in front of a real stack, "transparent" has to mean it, for every endpoint we are
+        not deliberately touching.
+        """
         assert self.session
-        url = self._upstream(request) + request.path
+        url = self._upstream(request) + request.path_qs
         raw = await request.read()
+
+        hdrs = {
+            k: v
+            for k, v in request.headers.items()
+            if k.lower() not in ("host", "content-length", "accept-encoding")
+        }
+
         async with self.session.request(
-            request.method, url, data=raw, headers={"Content-Type": "application/json"}
+            request.method, url, data=raw or None, headers=hdrs, allow_redirects=False
         ) as up:
-            return web.Response(
-                body=await up.read(), status=up.status, content_type=up.content_type
-            )
+            out = web.StreamResponse(status=up.status)
+            ct = up.headers.get("Content-Type")
+            if ct:
+                out.headers["Content-Type"] = ct
+            await out.prepare(request)
+            async for chunk in up.content.iter_any():
+                await out.write(chunk)
+            await out.write_eof()
+            return out
 
     async def health(self, _):
         s = {"status": "ok", "policy": self.policy, "stats": self.stats,

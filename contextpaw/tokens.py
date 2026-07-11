@@ -53,12 +53,19 @@ class CalibratedCounter(Counter):
             ratio = self._ratio
         return int(len(text) * ratio * self.SAFETY) + 1
 
+    # Below this, the chat template's fixed overhead dominates the count and the
+    # measured ratio is garbage. Found in production: a 26-char "say hello" prompt
+    # reported ~19 prompt_eval tokens -> 0.73 tok/char, which (because we keep the
+    # MAX) permanently poisoned the ratio and made everything compact far too early.
+    # One short prompt was enough to do it.
+    MIN_SAMPLE_CHARS = 1000
+
     def observe(self, text: str, actual_tokens: int) -> None:
         # Only learn from samples that look like a full, uncached prompt evaluation.
         # A cache hit reports FEWER tokens than were really in the prompt; learning
         # from that would teach us to under-count, which is the one failure we cannot
         # afford. Requiring the sample to raise the ratio filters those out for free.
-        if not text or actual_tokens <= 0:
+        if not text or actual_tokens <= 0 or len(text) < self.MIN_SAMPLE_CHARS:
             return
         observed = actual_tokens / len(text)
         with self._lock:

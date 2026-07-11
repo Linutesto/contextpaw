@@ -171,3 +171,22 @@ def test_summarizer_strides_across_a_pathological_span():
     joined = "".join(chunks)
     # must reach the far end, not just the first 5 chunks
     assert span[-10:] in joined or span[-2:] in joined, "must sample the tail, not truncate to the head"
+
+
+def test_short_prompts_never_poison_the_calibration():
+    """
+    Found by dogfooding, in production. `prompt_eval_count` includes the chat template's
+    fixed overhead. On a 26-char "say hello" prompt that overhead IS the whole count --
+    ~19 tokens / 26 chars = 0.73 tok/char. Because the counter keeps the MAX ratio (for
+    safety), that single short prompt permanently poisoned the estimate and made every
+    subsequent request compact far earlier than it needed to.
+    """
+    c = CalibratedCounter()
+    start = c.stats()["ratio"]
+
+    c.observe("Dis bonjour en une phrase.", 19)     # 26 chars -> 0.73 tok/char, garbage
+    assert c.stats()["ratio"] == start, "a short prompt must never move the ratio"
+
+    long_text = "Ceci est du texte de remplissage. " * 200  # ~6800 chars
+    c.observe(long_text, int(len(long_text) * 0.40))
+    assert c.stats()["ratio"] > start, "a long, representative sample must still teach us"

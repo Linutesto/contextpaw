@@ -36,6 +36,10 @@ def main() -> None:
     p.add_argument("--llamacpp-cmd", default=None,
                    help="command to start llama-server, so the arbiter can bring it up "
                         "(quote it: --llamacpp-cmd '/path/llama-server -m ... --port 8091')")
+    p.add_argument("--no-think", action="store_true",
+                   help="inject think:false for clients that didn't ask for thinking — "
+                        "gemma4/qwen3.x otherwise return an EMPTY response and the app "
+                        "has no idea why")
     p.add_argument("--min-hold", type=float, default=20.0,
                    help="seconds a runtime keeps the GPU before it can be switched away")
     a = p.parse_args()
@@ -49,6 +53,7 @@ def main() -> None:
         arbitrate=a.arbitrate,
         llamacpp_cmd=shlex.split(a.llamacpp_cmd) if a.llamacpp_cmd else None,
         min_hold=a.min_hold,
+        no_think=a.no_think,
     )
     extra = []
     if a.summarize:
