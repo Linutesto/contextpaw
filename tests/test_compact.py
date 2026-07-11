@@ -190,3 +190,46 @@ def test_short_prompts_never_poison_the_calibration():
     long_text = "Ceci est du texte de remplissage. " * 200  # ~6800 chars
     c.observe(long_text, int(len(long_text) * 0.40))
     assert c.stats()["ratio"] > start, "a long, representative sample must still teach us"
+
+
+def test_calibration_reads_both_backends_field_names():
+    """
+    Found in production: 55 real requests through llama.cpp, `samples: 0`. The counter
+    never learned anything, because we only looked for Ollama's `prompt_eval_count`.
+    llama.cpp reports the same number as `usage.prompt_tokens` (OpenAI shape). The
+    self-calibration this tool advertises was simply not running on half its backends.
+    """
+    from contextpaw.proxy import ContextPaw
+
+    paw = ContextPaw()
+    long_text = "Ceci est du texte de remplissage. " * 200  # > MIN_SAMPLE_CHARS
+    before = paw.counter.stats()["samples"]
+
+    # Ollama shape
+    paw._calibrate({"prompt": long_text}, {"prompt_eval_count": 9999})
+    assert paw.counter.stats()["samples"] == before + 1, "Ollama's field must be read"
+
+    # llama.cpp / OpenAI shape
+    paw._calibrate({"prompt": long_text}, {"usage": {"prompt_tokens": 9999}})
+    assert paw.counter.stats()["samples"] == before + 2, "llama.cpp's field must be read too"
+
+
+def test_pin_survives_a_restart(tmp_path, monkeypatch):
+    """
+    The unit runs Restart=always. If the proxy crashes mid-session, a forgotten pin means
+    the next background request evicts the model the pin existed to protect. Measured: a
+    plain `systemctl restart` dropped the pin silently. The pin must outlive the process.
+    """
+    import contextpaw.runtime as rt
+
+    monkeypatch.setattr(rt, "STATE", tmp_path)
+    monkeypatch.setattr(rt, "PIN_FILE", tmp_path / "pin.json")
+
+    rt.RuntimeManager._save_pin("llamacpp")
+
+    # a brand-new manager, as if the process had just restarted
+    fresh = rt.RuntimeManager(session=None)
+    assert fresh.pinned == "llamacpp", "the pin must be restored on startup"
+
+    rt.RuntimeManager._save_pin(None)
+    assert rt.RuntimeManager(session=None).pinned is None, "unpinning must persist too"

@@ -20,10 +20,12 @@ THE CALLER what was lost.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
 from aiohttp import web, ClientSession, ClientTimeout
+from aiohttp.client_exceptions import ClientConnectionResetError
 
 from .compact import compact_messages, compact_prompt, inject_digest, TooLongToCompact
 from .runtime import RuntimeManager, RuntimePinned
@@ -59,7 +61,8 @@ class ContextPaw:
         self.keep_recent = keep_recent
         self.counter = HFCounter(tokenizer) if tokenizer else CalibratedCounter()
         self.session: ClientSession | None = None
-        self.stats = {"requests": 0, "compacted": 0, "refused": 0, "retried_400": 0}
+        self.stats = {"requests": 0, "compacted": 0, "refused": 0, "retried_400": 0,
+                      "client_disconnects": 0}
 
         self.summarize_enabled = summarize
         self.summarizer_model = summarizer_model
@@ -298,9 +301,15 @@ class ContextPaw:
             out = web.StreamResponse(status=up.status, headers=self._hdrs(report))
             out.content_type = up.content_type or "application/json"
             await out.prepare(request)
-            async for chunk in up.content.iter_any():
-                await out.write(chunk)
-            await out.write_eof()
+            try:
+                async for chunk in up.content.iter_any():
+                    await out.write(chunk)
+                await out.write_eof()
+            except (ConnectionResetError, ClientConnectionResetError, asyncio.CancelledError):
+                # The caller hung up mid-stream. This is NORMAL, not an error: a game
+                # cancels an NPC line when the player walks away, an agent aborts a turn.
+                # Measured in production: 4 tracebacks in one Skyrim session, all benign.
+                self.stats["client_disconnects"] += 1
             return out
 
     def _hdrs(self, report) -> dict:
@@ -313,8 +322,21 @@ class ContextPaw:
         return h
 
     def _calibrate(self, body, data):
-        """Learn the real chars->tokens ratio from what the server actually read."""
-        actual = data.get("prompt_eval_count")
+        """
+        Learn the real chars->tokens ratio from what the server actually read.
+
+        The two backends report this under DIFFERENT names, and getting that wrong is
+        not a cosmetic bug: it means the counter silently never learns. Measured in
+        production -- 55 real requests through llama.cpp, `samples: 0`, because we were
+        only looking for Ollama's field. The self-calibration this tool advertises was
+        simply not running on half its backends.
+
+            Ollama     -> prompt_eval_count
+            llama.cpp  -> usage.prompt_tokens   (OpenAI shape)
+        """
+        actual = data.get("prompt_eval_count") or (data.get("usage") or {}).get(
+            "prompt_tokens"
+        )
         if not actual:
             return
         text = (
@@ -354,9 +376,12 @@ class ContextPaw:
             if ct:
                 out.headers["Content-Type"] = ct
             await out.prepare(request)
-            async for chunk in up.content.iter_any():
-                await out.write(chunk)
-            await out.write_eof()
+            try:
+                async for chunk in up.content.iter_any():
+                    await out.write(chunk)
+                await out.write_eof()
+            except (ConnectionResetError, ClientConnectionResetError, asyncio.CancelledError):
+                self.stats["client_disconnects"] += 1
             return out
 
     async def health(self, _):

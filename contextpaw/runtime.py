@@ -22,10 +22,19 @@ fight over the card.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import subprocess
 import time
+from pathlib import Path
+
+# A pin must outlive the process. The unit runs Restart=always, so a crash mid-session
+# would otherwise silently drop the pin -- and the very next background request would
+# evict the model you were pinning to protect. The pin exists precisely to survive
+# adversity; forgetting it on restart defeats the whole point.
+STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "contextpaw"
+PIN_FILE = STATE / "pin.json"
 
 
 class RuntimePinned(Exception):
@@ -60,7 +69,24 @@ class RuntimeManager:
         # Skyrim session with four NPCs streaming off llama.cpp, and a background service
         # fires one /api/* request at Ollama -- without a pin, the arbiter would evict
         # your game's model to serve it. With a pin, the intruder is refused instead.
-        self.pinned: str | None = None
+        self.pinned: str | None = self._load_pin()
+
+    # ---------- pin persistence ----------
+
+    @staticmethod
+    def _load_pin() -> str | None:
+        try:
+            return json.loads(PIN_FILE.read_text()).get("pin")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _save_pin(backend: str | None) -> None:
+        try:
+            STATE.mkdir(parents=True, exist_ok=True)
+            PIN_FILE.write_text(json.dumps({"pin": backend}))
+        except Exception:
+            pass  # a proxy must never die because it could not write a state file
 
     # ---------- probes ----------
 
@@ -184,9 +210,11 @@ class RuntimeManager:
         """Pin (or unpin) a runtime. A pinned runtime cannot be evicted."""
         if backend not in (None, "ollama", "llamacpp"):
             raise ValueError(backend)
-        if backend:
+        self.pinned = None               # release first, so ensure() is not blocked by
+        if backend:                      # the pin we are about to replace
             await self.ensure(backend)   # bring it up BEFORE pinning it
         self.pinned = backend
+        self._save_pin(backend)
         return await self.status()
 
     async def status(self) -> dict:
