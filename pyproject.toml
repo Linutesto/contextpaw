@@ -1,0 +1,18 @@
+[project]
+name = "contextpaw"
+version = "0.1.0"
+description = "Make LLM context overflow honest: stop Ollama truncating your prompt in silence, stop llama.cpp's 400 from killing your agent."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = ["aiohttp>=3.9"]
+
+[project.optional-dependencies]
+exact = ["tokenizers>=0.15"]
+
+[project.scripts]
+contextpaw = "contextpaw.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
