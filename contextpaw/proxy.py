@@ -100,17 +100,31 @@ class ContextPaw:
 
     # ---------- the actual work ----------
 
-    async def _apply(self, body: dict, backend: str = "ollama") -> tuple[dict, dict | None]:
+    async def _apply(self, body: dict, backend: str = "ollama",
+                     openai_shape: bool = False) -> tuple[dict, dict | None]:
         """Preflight + compact. Returns (possibly rewritten body, report|None)."""
         if self.no_think:
-            # The two backends spell "don't think" completely differently, and each one
-            # fails the same silent way if you get it wrong: Ollama returns an empty
-            # `response`, llama.cpp returns an empty `content` with the text stranded in
-            # `reasoning_content`. Sending Ollama's flag to llama.cpp does nothing at all
-            # -- so the option would quietly lie about what it did.
-            if backend == "ollama":
+            # THREE different spellings for the same intention, and every one of them fails
+            # SILENTLY if you pick the wrong one — 200 OK, empty content, text stranded in a
+            # field the caller has never heard of:
+            #
+            #   Ollama    /api/*   ->  {"think": false}
+            #                          otherwise `response` comes back ""
+            #   Ollama    /v1/*    ->  {"reasoning_effort": "none"}
+            #                          `think` is IGNORED here; `content` comes back "" and the
+            #                          text lands in `reasoning`. Measured.
+            #   llama.cpp /v1/*    ->  {"chat_template_kwargs": {"enable_thinking": false}}
+            #                          `content` comes back "" and the text lands in
+            #                          `reasoning_content`.
+            #
+            # Sending the wrong flag does not error. It just quietly does nothing, and the
+            # option lies about what it did. Get all three right.
+            if backend == "ollama" and not openai_shape:
                 if "think" not in body:
                     body = {**body, "think": False}
+            elif backend == "ollama" and openai_shape:
+                if "reasoning_effort" not in body:
+                    body = {**body, "reasoning_effort": "none"}
             else:
                 kw = dict(body.get("chat_template_kwargs") or {})
                 if "enable_thinking" not in kw:
@@ -192,7 +206,32 @@ class ContextPaw:
 
     # ---------- routing ----------
 
+    def _target_path(self, request) -> str:
+        """Strip an explicit backend prefix, if the caller used one."""
+        p = request.path
+        for pre in ("/ollama", "/llamacpp"):
+            if p.startswith(pre + "/"):
+                return p[len(pre):]
+        return p
+
     def _upstream(self, request) -> str:
+        # An EXPLICIT prefix beats every heuristic. A client that cannot set headers (most
+        # OpenAI SDKs point at a base_url and nothing else) still needs a way to say WHICH
+        # backend it wants — otherwise "/v1/*" is ambiguous and we have to guess.
+        #
+        # This is not hypothetical: dropping ContextPaw on port 11434 silently redirected
+        # an app's "Ollama" provider to llama.cpp, because /v1 routes there. The button
+        # said Ollama and served llama.cpp. Give callers a way to be unambiguous.
+        #
+        #     http://host:11434/ollama/v1/chat/completions    -> Ollama
+        #     http://host:11434/llamacpp/v1/chat/completions   -> llama.cpp
+        #
+        # Both still get compaction and the GPU arbiter.
+        if request.path.startswith("/ollama/"):
+            return self.ollama
+        if request.path.startswith("/llamacpp/"):
+            return self.llamacpp
+
         # explicit override wins; otherwise Ollama-shaped paths go to Ollama
         forced = request.headers.get("X-ContextPaw-Backend")
         if forced == "llamacpp":
@@ -207,7 +246,7 @@ class ContextPaw:
         # /api/*" to llama.cpp, so the CLI's liveness ping went to a llama-server that was
         # not running and came back ConnectionRefused. We are a transparent proxy; the
         # DEFAULT destination has to be the thing we are transparently proxying.
-        if not request.path.startswith("/v1/"):
+        if not self._target_path(request).startswith("/v1/"):
             return self.ollama
 
         # When the arbiter is running, route /v1/* to llama.cpp even if it is currently
@@ -231,7 +270,26 @@ class ContextPaw:
         if self.rt and self.rt.enabled:
             want = "llamacpp" if self._upstream(request) == self.llamacpp else "ollama"
             try:
-                await self.rt.ensure(want)
+                note = await self.rt.ensure(want)
+                # ensure() can DECLINE — min_hold stops it thrashing the card. We used to
+                # ignore that and forward anyway, straight into a backend we had just
+                # refused to start: the caller got a ConnectionRefused dressed up as a 500.
+                # If we could not give them the runtime they asked for, say so.
+                if self.rt.active != want:
+                    return web.json_response(
+                        {"error": {
+                            "type": "runtime_unavailable",
+                            "message": note.get("refused")
+                                       or f"{want} is not the active runtime and could not be switched to",
+                            "active": self.rt.active,
+                            "wanted": want,
+                            "retry_after_seconds": max(
+                                0, round(self.rt.min_hold - (time.time() - self.rt._since), 1)
+                            ),
+                        }},
+                        status=503,
+                        headers={"Retry-After": str(int(self.rt.min_hold))},
+                    )
             except RuntimePinned as e:
                 return web.json_response(
                     {"error": {"type": "runtime_pinned", "message": str(e),
@@ -245,8 +303,9 @@ class ContextPaw:
                 )
 
         backend = "llamacpp" if self._upstream(request) == self.llamacpp else "ollama"
+        openai_shape = self._target_path(request).startswith("/v1/")
         try:
-            body, report = await self._apply(body, backend)
+            body, report = await self._apply(body, backend, openai_shape)
         except TooLongToCompact as e:
             self.stats["refused"] += 1
             return web.json_response(
@@ -259,7 +318,7 @@ class ContextPaw:
                 status=413,
             )
 
-        upstream = self._upstream(request) + request.path
+        upstream = self._upstream(request) + self._target_path(request)
 
         # The two APIs disagree on what `stream` defaults to when the field is ABSENT,
         # and guessing wrong is fatal:
@@ -378,7 +437,8 @@ class ContextPaw:
         not deliberately touching.
         """
         assert self.session
-        url = self._upstream(request) + request.path_qs
+        qs = request.query_string
+        url = self._upstream(request) + self._target_path(request) + (f"?{qs}" if qs else "")
         raw = await request.read()
 
         hdrs = {
@@ -522,11 +582,15 @@ def build_app(paw: ContextPaw) -> web.Application:
     app.on_cleanup.append(_cleanup)
 
     app.router.add_get("/contextpaw/health", paw.health)
-    app.router.add_get("/v1/models", paw.models)
     app.router.add_get("/contextpaw/runtime", lambda r: _runtime_status(paw, r))
     app.router.add_post("/contextpaw/runtime", lambda r: _runtime_pin(paw, r))
-    for p in ("/api/generate", "/api/chat", "/v1/completions", "/v1/chat/completions"):
+    endpoints = ("/api/generate", "/api/chat", "/v1/completions", "/v1/chat/completions")
+    for p in endpoints:
         app.router.add_post(p, paw.handle)
+        for pre in ("/ollama", "/llamacpp"):   # explicit backend selection by path
+            app.router.add_post(pre + p, paw.handle)
+    for pre in ("", "/ollama", "/llamacpp"):
+        app.router.add_get(pre + "/v1/models", paw.models)
     app.router.add_route("*", "/{tail:.*}", paw._passthrough)
     return app
 
