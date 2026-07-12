@@ -233,3 +233,48 @@ def test_pin_survives_a_restart(tmp_path, monkeypatch):
 
     rt.RuntimeManager._save_pin(None)
     assert rt.RuntimeManager(session=None).pinned is None, "unpinning must persist too"
+
+
+# --------------------------- routing & API defaults ---------------------------
+
+class _Req:
+    def __init__(self, path, headers=None):
+        self.path = path
+        self.headers = headers or {}
+
+
+def test_only_v1_paths_go_to_llamacpp():
+    """
+    Broke `ollama run` in production. An earlier version routed "anything not /api/*" to
+    llama.cpp -- so the CLI's bare `HEAD /` liveness ping went to a llama-server that was
+    not running, and came back ConnectionRefused. We sit on Ollama's port pretending to be
+    Ollama: the DEFAULT destination must be Ollama.
+    """
+    from contextpaw.proxy import ContextPaw
+
+    paw = ContextPaw(arbitrate=True, llamacpp_cmd=["/bin/true"])
+
+    assert paw._upstream(_Req("/v1/chat/completions")) == paw.llamacpp
+    assert paw._upstream(_Req("/v1/models")) == paw.llamacpp
+
+    assert paw._upstream(_Req("/")) == paw.ollama, "the liveness ping must reach Ollama"
+    assert paw._upstream(_Req("/api/chat")) == paw.ollama
+    assert paw._upstream(_Req("/api/tags")) == paw.ollama
+
+
+def test_stream_default_differs_between_the_two_apis():
+    """
+    Ollama defaults `stream` to TRUE when the field is absent (it returns ndjson); the
+    OpenAI API defaults it to FALSE. Assuming "absent means false" made us parse an ndjson
+    stream as a single JSON object -- and `ollama run` sends exactly such a request (a
+    preload with no `stream` key), so the CLI died with a 500.
+    """
+    def streaming_for(path, body):
+        if "stream" in body:
+            return bool(body["stream"])
+        return path.startswith("/api/")
+
+    assert streaming_for("/api/generate", {}) is True, "Ollama streams by default"
+    assert streaming_for("/v1/chat/completions", {}) is False, "OpenAI does not"
+    assert streaming_for("/api/generate", {"stream": False}) is False, "explicit wins"
+    assert streaming_for("/v1/chat/completions", {"stream": True}) is True

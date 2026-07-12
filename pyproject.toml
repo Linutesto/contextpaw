@@ -1,6 +1,6 @@
 [project]
 name = "contextpaw"
-version = "0.1.4"
+version = "0.1.5"
 description = "Make LLM context overflow honest: stop Ollama truncating your prompt in silence, stop llama.cpp's 400 from killing your agent."
 readme = "README.md"
 license = { text = "MIT" }

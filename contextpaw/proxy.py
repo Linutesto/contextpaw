@@ -199,16 +199,22 @@ class ContextPaw:
             return self.llamacpp
         if forced == "ollama":
             return self.ollama
-        if request.path.startswith("/api/"):
+        # ONLY the OpenAI-shaped paths go to llama.cpp. Everything else -- /api/*, and the
+        # bare "/" that `ollama run` HEADs to check the server is alive -- belongs to
+        # Ollama, because we are standing on Ollama's port pretending to be Ollama.
+        #
+        # Getting this wrong broke `ollama run`: an earlier version routed "anything not
+        # /api/*" to llama.cpp, so the CLI's liveness ping went to a llama-server that was
+        # not running and came back ConnectionRefused. We are a transparent proxy; the
+        # DEFAULT destination has to be the thing we are transparently proxying.
+        if not request.path.startswith("/v1/"):
             return self.ollama
 
-        # OpenAI-shaped path (/v1/*).
-        #
-        # When the arbiter is running, route to llama.cpp even if it is currently DOWN --
-        # bringing it up is precisely the arbiter's job. Gating on `_llamacpp_up` (a flag
-        # sampled once at startup) would mean llama.cpp never gets started: every request
-        # would see it down, fall back to Ollama, and the arbiter would never fire. The
-        # snake eats its own tail.
+        # When the arbiter is running, route /v1/* to llama.cpp even if it is currently
+        # DOWN -- bringing it up is precisely the arbiter's job. Gating on `_llamacpp_up`
+        # (a flag sampled once at startup) would mean llama.cpp never gets started: every
+        # request would see it down, fall back to Ollama, and the arbiter would never
+        # fire. The snake eats its own tail.
         if self.arbitrate and self.llamacpp_cmd:
             return self.llamacpp
         return self.llamacpp if self._llamacpp_up else self.ollama
@@ -254,7 +260,20 @@ class ContextPaw:
             )
 
         upstream = self._upstream(request) + request.path
-        streaming = bool(body.get("stream"))
+
+        # The two APIs disagree on what `stream` defaults to when the field is ABSENT,
+        # and guessing wrong is fatal:
+        #
+        #   Ollama  /api/*  -> defaults to TRUE  (returns application/x-ndjson)
+        #   OpenAI  /v1/*   -> defaults to FALSE (returns a single JSON object)
+        #
+        # Assuming "absent means false" made us parse an ndjson stream as one JSON blob.
+        # `ollama run` sends exactly such a request (a preload with no `stream` key), so
+        # the CLI died with a 500 the moment ContextPaw sat in front of it.
+        if "stream" in body:
+            streaming = bool(body["stream"])
+        else:
+            streaming = request.path.startswith("/api/")
 
         resp = await self._forward(upstream, body, streaming, request, report)
         return resp
@@ -405,13 +424,22 @@ class ContextPaw:
         `contextpaw.budget` = what we will let a prompt occupy after reserving room for
         the reply. That is the number a compaction step should be planning against.
         """
-        backend = self._upstream(request)
-        upstream = backend + "/v1/models"
-        try:
-            async with self.session.get(upstream) as up:
-                data = await up.json()
-        except Exception as e:
-            return web.json_response({"error": str(e)}, status=502)
+        # Listing models is a METADATA query. It must not require a particular runtime to
+        # be up, and it must never trigger a GPU switch just to answer "what have you
+        # got?". Ask the routed backend; if it is not running, ask the other one.
+        primary = self._upstream(request)
+        fallback = self.ollama if primary == self.llamacpp else self.llamacpp
+
+        data = None
+        for backend in (primary, fallback):
+            try:
+                async with self.session.get(backend + "/v1/models") as up:
+                    data = await up.json()
+                break
+            except Exception:
+                continue
+        if data is None:
+            return web.json_response({"error": "no backend reachable"}, status=502)
 
         effective = await self._effective_ctx(backend)
         for m in data.get("data", []) or data.get("models", []) or []:
