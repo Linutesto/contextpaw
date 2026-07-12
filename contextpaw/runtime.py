@@ -113,6 +113,11 @@ class RuntimeManager:
                 os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
             except Exception:
                 self._proc.terminate()
+        elif await self._llamacpp_alive():
+            # We did not start it -- we ADOPTED it after a restart (KillMode=process lets
+            # llama-server outlive us). We still have to be able to evict it, so kill by
+            # name rather than by a handle we no longer hold.
+            subprocess.run(["pkill", "-x", "llama-server"], check=False)
         for _ in range(50):
             if not await self._llamacpp_alive():
                 return

@@ -384,6 +384,70 @@ class ContextPaw:
                 self.stats["client_disconnects"] += 1
             return out
 
+    async def models(self, request):
+        """
+        GET /v1/models — but with the ONE number an agent harness actually needs.
+
+        A harness cannot manage context it cannot measure, and neither backend tells it
+        the truth:
+
+          Ollama     /v1/models returns {id, object, created, owned_by}. No context length
+                     at all. It *knows* the value -- /api/show reports
+                     gemma4.context_length: 131072 -- it just never puts it on the OpenAI
+                     endpoint.
+          llama.cpp  reports meta.n_ctx correctly, but under a non-standard key.
+
+        And the advertised number is a trap anyway: 131072 is what the model was TRAINED
+        with. The runtime had actually loaded it at 16384. A harness trusting the
+        advertised figure overruns by 8x and gets silently truncated for its trouble.
+
+        So we report `context_length` = what is ACTUALLY LOADED right now, plus
+        `contextpaw.budget` = what we will let a prompt occupy after reserving room for
+        the reply. That is the number a compaction step should be planning against.
+        """
+        backend = self._upstream(request)
+        upstream = backend + "/v1/models"
+        try:
+            async with self.session.get(upstream) as up:
+                data = await up.json()
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=502)
+
+        effective = await self._effective_ctx(backend)
+        for m in data.get("data", []) or data.get("models", []) or []:
+            if not isinstance(m, dict):
+                continue
+            trained = ((m.get("meta") or {}).get("n_ctx_train")) or None
+            if effective:
+                m["context_length"] = effective
+                m["contextpaw"] = {
+                    "context_length_loaded": effective,
+                    "context_length_trained": trained,
+                    "budget": max(effective - 512 - self.margin, 512),
+                    "note": (
+                        "context_length is what the runtime ACTUALLY loaded, not what the "
+                        "model was trained with. Plan compaction against `budget`."
+                    ),
+                }
+        return web.json_response(data)
+
+    async def _effective_ctx(self, backend: str) -> int | None:
+        """The context the model is loaded with RIGHT NOW — not its advertised maximum."""
+        try:
+            if backend == self.llamacpp:
+                async with self.session.get(f"{self.llamacpp}/props") as r:
+                    d = await r.json()
+                return (d.get("default_generation_settings") or {}).get("n_ctx")
+            async with self.session.get(f"{self.ollama}/api/ps") as r:
+                d = await r.json()
+            for m in d.get("models", []):
+                ctx = m.get("context_length") or m.get("context")
+                if ctx:
+                    return int(ctx)
+        except Exception:
+            pass
+        return self.default_ctx  # nothing loaded yet: what we would budget against
+
     async def health(self, _):
         s = {"status": "ok", "policy": self.policy, "stats": self.stats,
              "counter": self.counter.name, "exact": self.counter.exact()}
@@ -430,6 +494,7 @@ def build_app(paw: ContextPaw) -> web.Application:
     app.on_cleanup.append(_cleanup)
 
     app.router.add_get("/contextpaw/health", paw.health)
+    app.router.add_get("/v1/models", paw.models)
     app.router.add_get("/contextpaw/runtime", lambda r: _runtime_status(paw, r))
     app.router.add_post("/contextpaw/runtime", lambda r: _runtime_pin(paw, r))
     for p in ("/api/generate", "/api/chat", "/v1/completions", "/v1/chat/completions"):
