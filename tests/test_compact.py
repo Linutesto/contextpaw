@@ -69,12 +69,27 @@ def test_recent_messages_are_never_evicted():
     assert "RECENT so what is it?" in texts
 
 
-def test_biggest_evictable_messages_go_first():
-    """Stale tool dumps are the cheapest thing to lose and the biggest win."""
+def test_shrink_before_evict():
+    """
+    SHRINK BEFORE DELETE. This ordering is the whole ballgame.
+
+    Deleting a small tool result that happens to hold the answer frees a handful of tokens
+    and loses everything. Shrinking a huge pile of filler middle-out frees thousands and
+    loses almost nothing, because its head and tail survive.
+
+    Measured with the old order (evict-biggest-first, shrink as a last resort): a big
+    USELESS message protected by the `recent` window pushed the algorithm into deleting a
+    small USEFUL one to make up the difference -- and the agent then answered a question
+    from a log it no longer had.
+    """
     out, rep = compact_messages(_msgs(), budget=300, count=wc, keep_recent=2)
     texts = " ".join(m["content"] for m in out)
-    assert "HUGE " not in texts, "the old (evictable) tool dump should be gone"
+
+    assert "shrink-in-place" in rep.strategy
     assert rep.evicted_tokens > 4000
+    assert sum(wc(m["content"]) for m in out) <= 300
+    # the big dumps are reduced, not vaporised -- their heads still say what they were
+    assert "HUGE" in texts, "shrinking must preserve the head of a big tool output"
 
 
 def test_huge_recent_tool_output_is_shrunk_not_deadlocked():
@@ -278,3 +293,114 @@ def test_stream_default_differs_between_the_two_apis():
     assert streaming_for("/v1/chat/completions", {}) is False, "OpenAI does not"
     assert streaming_for("/api/generate", {"stream": False}) is False, "explicit wins"
     assert streaming_for("/v1/chat/completions", {"stream": True}) is True
+
+
+# --------------------------- orphan tool messages ---------------------------
+
+def test_orphan_tool_message_is_rescued():
+    """
+    A `role: "tool"` message NOT preceded by an assistant carrying `tool_calls` is an
+    orphan, and the chat template silently discards it. Measured on gemma-4-12b, same log,
+    same question, only the role changed:
+
+        orphan role=tool ............ 0/3 facts  ("Please provide the log you are
+                                                   referring to!")
+        assistant.tool_calls + tool .. 3/3 facts
+        remapped to role=user ....... 3/3 facts
+
+    Ollama returns 200 either way. The tool output simply never reaches the model.
+    """
+    from contextpaw.compact import rescue_orphan_tools
+
+    out, n = rescue_orphan_tools([
+        {"role": "user", "content": "find the bug"},
+        {"role": "tool", "content": "ERROR on orion-7"},        # orphan
+    ])
+    assert n == 1
+    assert out[1]["role"] == "user", "an orphan tool result must be re-parented, not lost"
+    assert "orion-7" in out[1]["content"], "its content must survive intact"
+    assert "TOOL OUTPUT" in out[1]["content"], "and be labelled as tool output"
+
+
+def test_properly_parented_tool_message_is_left_alone():
+    from contextpaw.compact import rescue_orphan_tools
+
+    msgs = [
+        {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read"}}]},
+        {"role": "tool", "content": "ERROR on orion-7"},
+    ]
+    out, n = rescue_orphan_tools(msgs)
+    assert n == 0 and out[1]["role"] == "tool", "a valid tool sequence must not be touched"
+
+
+def test_compaction_does_not_orphan_a_tool_result():
+    """
+    The one that matters, and the one we could have shipped: OUR OWN eviction can create an
+    orphan. Drop the assistant message that carried the tool_calls, keep the tool result
+    that followed it, and we have handed the runtime something it will delete without a
+    word. The tool output survives our budget and dies in the template.
+    """
+    msgs = [
+        {"role": "system", "content": "sys " * 10},
+        {"role": "user", "content": "GOAL find the bug"},
+        {"role": "assistant", "content": "calling read_file",
+         "tool_calls": [{"function": {"name": "read_file"}}]},
+        {"role": "tool", "content": "NEEDLE-ANANAS " + ("pad " * 400)},
+        {"role": "user", "content": "so what was it?"},
+    ]
+    out, rep = compact_messages(msgs, budget=120, count=wc, keep_recent=1)
+
+    for i, m in enumerate(out):
+        if m.get("role") == "tool":
+            prev = out[i - 1] if i else None
+            assert prev and prev.get("role") == "assistant" and prev.get("tool_calls"), (
+                "a tool message survived without its parent — the template will eat it"
+            )
+    texts = " ".join(str(m.get("content", "")) for m in out)
+    assert "NEEDLE-ANANAS" in texts, "the tool output's head must reach the model somehow"
+
+
+def test_first_user_message_is_the_goal_and_is_pinned():
+    """
+    Measured: the task goal was evicted at 29 tokens, and the agent then confidently
+    answered a question it no longer knew it had been asked. `system` did not protect it,
+    and in a long loop it is nowhere near `recent`.
+    """
+    msgs = [
+        {"role": "system", "content": "sys " * 5},
+        {"role": "user", "content": "GOAL-SENTINEL find why the deploy failed"},
+    ] + [
+        {"role": "assistant", "content": "chatter " * 200} for _ in range(6)
+    ] + [
+        {"role": "user", "content": "well?"},
+    ]
+    out, rep = compact_messages(msgs, budget=300, count=wc, keep_recent=2)
+    texts = " ".join(str(m.get("content", "")) for m in out)
+    assert "GOAL-SENTINEL" in texts, "an agent that forgets its task is worse than one that fails"
+    assert sum(wc(m.get("content", "")) for m in out) <= 300
+
+
+def test_marker_overhead_is_a_real_structural_limit():
+    """
+    Honest limit, found while fixing the above and worth stating rather than hiding.
+
+    Middle-out shrinking pays a ~30-token elision marker PER MESSAGE. Under a tight budget
+    with many messages, the markers alone can exceed the budget: 8 messages x 30 tokens =
+    240, against a budget of 150. There is no clever fix — you cannot annotate 8 holes in
+    fewer tokens than it takes to describe 8 holes.
+
+    So at extreme compression ratios ContextPaw raises rather than pretending. That is the
+    correct behaviour: refusing is honest, and silently shipping a payload that lost the
+    system prompt is exactly what we exist to prevent.
+    """
+    msgs = [{"role": "system", "content": "sys " * 5},
+            {"role": "user", "content": "GOAL find it"}] \
+         + [{"role": "assistant", "content": "chatter " * 200} for _ in range(6)] \
+         + [{"role": "user", "content": "well?"}]
+
+    with pytest.raises(TooLongToCompact):
+        compact_messages(msgs, budget=150, count=wc, keep_recent=2)
+
+    # give it enough room to pay for its own annotations and it succeeds
+    out, rep = compact_messages(msgs, budget=400, count=wc, keep_recent=2)
+    assert sum(wc(m.get("content", "")) for m in out) <= 400
